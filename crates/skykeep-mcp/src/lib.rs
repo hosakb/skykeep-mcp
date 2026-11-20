@@ -1516,8 +1516,200 @@ enum ReminderWrite {
         due_at: Option<i64>,
         all_day: Option<bool>,
         flagged: Option<bool>,
+        // Left out of the approval record when unset, so a plain create reads as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repeat: Option<RepeatArg>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        due_time_alert: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        early_alert: Option<EarlyAlertArg>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timezone: Option<String>,
     },
 }
+
+#[derive(Deserialize, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RepeatFrequency {
+    Daily,
+}
+
+/// A new reminder's repeat: daily, until the end of `until` (`YYYY-MM-DD`) or for ever.
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RepeatArg {
+    frequency: RepeatFrequency,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    until: Option<String>,
+}
+
+#[derive(Deserialize, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AlertUnit {
+    Minutes,
+    Hours,
+    Days,
+    Weeks,
+    Months,
+}
+
+impl AlertUnit {
+    /// Apple's `dueDateDeltaUnit`.
+    fn apple(self) -> i64 {
+        match self {
+            AlertUnit::Minutes => 0,
+            AlertUnit::Hours => 1,
+            AlertUnit::Days => 2,
+            AlertUnit::Weeks => 3,
+            AlertUnit::Months => 4,
+        }
+    }
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct EarlyAlertArg {
+    amount: i64,
+    unit: AlertUnit,
+}
+
+/// The largest early-alert amount Apple's writer takes.
+const MOST_EARLY_ALERT: i64 = 10_000;
+
+/// A create's repeat and alerts, checked against its date and turned into what is queued, with
+/// every record id chosen now. Refused with a code naming the first combination that does
+/// not work; nothing is queued then.
+struct CreateOptions {
+    timezone: Option<String>,
+    repeat: Option<quince_sync::reminders::CreateRepeat>,
+    alarm: Option<quince_sync::reminders::CreateAlarm>,
+    early_alert: Option<quince_sync::reminders::CreateEarlyAlert>,
+}
+
+fn part_id() -> String {
+    uuid::Uuid::new_v4().to_string().to_uppercase()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_options(
+    library: &Library,
+    due_at: Option<i64>,
+    all_day: Option<bool>,
+    repeat: Option<RepeatArg>,
+    due_time_alert: Option<bool>,
+    early_alert: Option<EarlyAlertArg>,
+    timezone: Option<String>,
+) -> Result<CreateOptions, &'static str> {
+    use quince_sync::reminders as r;
+    let all_day = all_day.unwrap_or(false) && due_at.is_some();
+    let timed = due_at.is_some() && !all_day;
+    let timezone = match timezone {
+        Some(name) => Some(r::iana_zone(&name).ok_or("unknown_timezone")?),
+        None => None,
+    };
+    if timezone.is_some() && !timed {
+        return Err("timezone_requires_timed_due_at");
+    }
+    // A timed create with options is kept in one zone from here on: chosen now, queued, and
+    // used for its repeat's end and by every later send, whatever this computer's zone becomes.
+    let any_option = repeat.is_some() || due_time_alert == Some(true) || early_alert.is_some();
+    let timezone = match timezone {
+        None if timed && any_option => Some(r::system_zone()),
+        other => other,
+    };
+    let alarm = if due_time_alert == Some(true) {
+        if due_at.is_none() {
+            return Err("due_time_alert_requires_due_at");
+        }
+        if all_day {
+            return Err("all_day_cannot_have_timed_alert");
+        }
+        Some(r::CreateAlarm {
+            alarm_id: part_id(),
+            trigger_id: part_id(),
+        })
+    } else {
+        None
+    };
+    let early_alert = match early_alert {
+        None => None,
+        Some(alert) => {
+            if !(1..=MOST_EARLY_ALERT).contains(&alert.amount) {
+                return Err("invalid_early_alert");
+            }
+            if due_at.is_none() {
+                return Err("early_alert_requires_due_at");
+            }
+            if all_day {
+                return Err("all_day_cannot_have_timed_alert");
+            }
+            let account = library
+                .early_alert_account()
+                .map_err(|_| "library_unavailable")?
+                .ok_or("early_alert_account_unavailable")?;
+            Some(r::CreateEarlyAlert {
+                count: alert.amount,
+                unit: alert.unit.apple(),
+                account,
+                id: part_id(),
+            })
+        }
+    };
+    let repeat = match repeat {
+        None => None,
+        Some(repeat) => {
+            let due = due_at.ok_or("repeat_requires_due_at")?;
+            let RepeatFrequency::Daily = repeat.frequency;
+            let end_at = match repeat.until {
+                None => None,
+                Some(until) => {
+                    // An all-day date is that day's midnight in UTC, so its last day is read
+                    // there; a timed one in the zone it rings in.
+                    let zone = if all_day {
+                        "UTC".to_string()
+                    } else {
+                        timezone.clone().unwrap_or_else(r::system_zone)
+                    };
+                    let end = r::end_of_day(&until, &zone).ok_or("invalid_repeat_end")?;
+                    if end < due {
+                        return Err("repeat_end_before_due");
+                    }
+                    Some(end)
+                }
+            };
+            Some(r::CreateRepeat {
+                frequency: 0,
+                interval: 1,
+                end_at,
+                rule_id: part_id(),
+            })
+        }
+    };
+    Ok(CreateOptions {
+        timezone,
+        repeat,
+        alarm,
+        early_alert,
+    })
+}
+
+/// The options a queued create carries, as the reply names them: no record ids or account id.
+fn options_view(c: &quince_sync::reminders::Create) -> Value {
+    let unit = |u: i64| match u {
+        0 => "minutes",
+        1 => "hours",
+        2 => "days",
+        3 => "weeks",
+        _ => "months",
+    };
+    json!({
+        "timezone": c.timezone,
+        "repeat": c.repeat.as_ref().map(|r| json!({"frequency":"daily","ends_at":r.end_at})),
+        "due_time_alert": c.alarm.is_some(),
+        "early_alert": c.early_alert.as_ref().map(|e| json!({"amount":e.count,"unit":unit(e.unit)})),
+    })
+}
+
 fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value, &'static str> {
     match args {
         ReminderWrite::Delete { guid } => {
@@ -1583,6 +1775,7 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
                 priority: e.priority,
                 list_guid: e.list_guid,
                 parent_guid: e.parent_guid,
+                timezone: None,
             };
             quince_sync::reminders::record_reminder_edit(library, &reminder, &edit)
                 .map_err(|_| "write_refused")?;
@@ -1594,6 +1787,10 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
             due_at,
             all_day,
             flagged,
+            repeat,
+            due_time_alert,
+            early_alert,
+            timezone,
         } => {
             if !library
                 .reminder_lists()
@@ -1606,18 +1803,33 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
             if title.trim().is_empty() {
                 return Err("title_required");
             }
-            let guid = quince_sync::reminders::record_reminder_create(
+            let options = create_options(
                 library,
-                &quince_sync::reminders::Create {
-                    list_guid,
-                    title,
-                    due_at,
-                    all_day,
-                    flagged,
-                },
+                due_at,
+                all_day,
+                repeat,
+                due_time_alert,
+                early_alert,
+                timezone,
+            )?;
+            let create = quince_sync::reminders::Create {
+                list_guid,
+                title,
+                due_at,
+                all_day,
+                flagged,
+                timezone: options.timezone,
+                repeat: options.repeat,
+                alarm: options.alarm,
+                early_alert: options.early_alert,
+            };
+            let guid = quince_sync::reminders::record_reminder_create(library, &create)
+                .map_err(|_| "write_refused")?;
+            // Queued here only. `sync` says which queued writes CloudKit took; nothing reads
+            // the repeat or alerts back from Apple, so remote_verified stays false.
+            Ok(
+                json!({"guid":guid,"status":"queued","queued":true,"cloudkit_accepted":false,"remote_verified":false,"options":options_view(&create)}),
             )
-            .map_err(|_| "write_refused")?;
-            Ok(json!({"guid":guid,"status":"queued","remote_verified":false}))
         }
     }
 }
@@ -1676,7 +1888,7 @@ fn tools() -> Vec<Value> {
         tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
     tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"]}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). Deletions need local terminal approval. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions need local terminal approval. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats, read in timezone."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at and an early alert already set on one of the user's reminders from an Apple device.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));

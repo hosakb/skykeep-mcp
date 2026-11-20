@@ -903,6 +903,116 @@ pub async fn set_early_alert_cloudkit(
     Ok(())
 }
 
+/// The `DueDateDeltaAlertsData` JSON with one early alert added under `id`, chosen before it
+/// was sent, and every alert already there kept. `None` when an alert of that id is there
+/// already, so a send repeated after a lost answer writes nothing more.
+#[must_use]
+pub fn early_alert_added_json(
+    existing: Option<&Value>,
+    account: &str,
+    reminder_guid: &str,
+    (count, unit): (i64, i64),
+    id: &str,
+    now_apple: f64,
+) -> Option<Value> {
+    let mut blob = existing
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut alerts = blob
+        .get("dueDateDeltaAlerts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if alerts.iter().any(|a| {
+        a.get("identifier")
+            .and_then(Value::as_str)
+            .is_some_and(|x| x.eq_ignore_ascii_case(id))
+    }) {
+        return None;
+    }
+    if blob
+        .get("accountIdentifier")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        blob["accountIdentifier"] = json!(account);
+    }
+    blob["reminderIdentifier"] = json!(bare(reminder_guid));
+    if blob.get("minimumSupportedVersion").is_none() {
+        blob["minimumSupportedVersion"] = json!(MINIMUM_SUPPORTED_VERSION);
+    }
+    alerts.push(json!({
+        "identifier": id,
+        "dueDateDeltaCount": -count.abs(),
+        "dueDateDeltaUnit": unit,
+        "creationDate": now_apple,
+        "minimumSupportedAppVersion": 0,
+    }));
+    blob["dueDateDeltaAlerts"] = Value::Array(alerts);
+    Some(blob)
+}
+
+/// Add one early alert to a reminder under an id chosen before it is sent, keeping any it has:
+/// [`set_early_alert_cloudkit`]'s checks and account id, for a reminder made here with its
+/// alert. Sent again after a lost answer or a restart, it finds its alert and writes nothing.
+pub async fn add_early_alert_named_cloudkit(
+    http: &reqwest::Client,
+    root: &str,
+    params: Vec<(String, String)>,
+    reminder_guid: &str,
+    (count, unit): (i64, i64),
+    account: Option<&str>,
+    id: &str,
+) -> Result<()> {
+    writes()?;
+    if count == 0 || count.abs() > 10_000 || !(0..=4).contains(&unit) {
+        return Err(Error::Refused(
+            "That isn't an early reminder Apple offers.".into(),
+        ));
+    }
+    let zc = client(http, root, params);
+    let reminder = live_reminder(&zc, reminder_guid).await?;
+    if field::int(&reminder, "DueDate").is_none() {
+        return Err(Error::Refused(
+            "Give this a date before asking to be reminded early.".into(),
+        ));
+    }
+    let account = early_alert_blob(&reminder)
+        .and_then(|b| {
+            b.get("accountIdentifier")?
+                .as_str()
+                .map(ToString::to_string)
+        })
+        .or_else(|| account.map(ToString::to_string))
+        .ok_or_else(|| {
+            Error::Refused(
+                "Set one early reminder on an Apple device first; Skykeep needs what it writes."
+                    .into(),
+            )
+        })?;
+    let now = apple_now();
+    zc.edit_record_signed(ZONE, reminder_guid, "Reminder", |r| {
+        let blob = early_alert_added_json(
+            early_alert_blob(r).as_ref(),
+            &account,
+            reminder_guid,
+            (count, unit),
+            id,
+            now,
+        )?;
+        Some(json!({
+            "DueDateDeltaAlertsData": {
+                "type": "ENCRYPTED_BYTES",
+                "value": B64.encode(blob.to_string().as_bytes()),
+            },
+            "LastModifiedDate": { "type": "TIMESTAMP", "value": now_millis() },
+        }))
+    })
+    .await?;
+    Ok(())
+}
+
 /// Make a section in a list. Answers it, to be shown before the next pass.
 pub async fn create_section_cloudkit(
     http: &reqwest::Client,

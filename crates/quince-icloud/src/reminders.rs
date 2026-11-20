@@ -1491,6 +1491,58 @@ pub async fn set_repeat_until_cloudkit(
     end_at: Option<i64>,
     days: &[i64],
 ) -> Result<()> {
+    set_repeat_inner(
+        http,
+        ckdatabasews_root,
+        params,
+        reminder,
+        repeat,
+        end_at,
+        days,
+        None,
+    )
+    .await
+}
+
+/// [`set_repeat_until_cloudkit`] under a rule id chosen before it is sent (the bare id, no
+/// `RecurrenceRule/` prefix), so a send repeated after a lost answer or a restart reuses the
+/// rule it made rather than making another. Already pointing at that rule, the reminder is
+/// left as it is; the rule made but not yet pointed at is pointed at, not made twice.
+#[allow(clippy::too_many_arguments)]
+pub async fn set_repeat_named_cloudkit(
+    http: &reqwest::Client,
+    ckdatabasews_root: &str,
+    params: Vec<(String, String)>,
+    reminder: &Reminder,
+    repeat: Repeat,
+    end_at: Option<i64>,
+    days: &[i64],
+    rule_id: &str,
+) -> Result<()> {
+    set_repeat_inner(
+        http,
+        ckdatabasews_root,
+        params,
+        reminder,
+        Some(repeat),
+        end_at,
+        days,
+        Some(rule_id),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn set_repeat_inner(
+    http: &reqwest::Client,
+    ckdatabasews_root: &str,
+    params: Vec<(String, String)>,
+    reminder: &Reminder,
+    repeat: Option<Repeat>,
+    end_at: Option<i64>,
+    days: &[i64],
+    rule_id: Option<&str>,
+) -> Result<()> {
     // Apple will not schedule a repeat with nothing to repeat from, and a reminder that
     // repeats from no date would simply never come back.
     if repeat.is_some() && reminder.due_at.is_none() {
@@ -1516,6 +1568,10 @@ pub async fn set_repeat_until_cloudkit(
                 .collect()
         })
         .unwrap_or_default();
+    // Sent before and pointed at already: nothing left to do, and nothing to retire.
+    if rule_id.is_some_and(|id| existing.iter().any(|x| x.eq_ignore_ascii_case(id))) {
+        return Ok(());
+    }
 
     let wanted: Vec<String> = match repeat {
         None => Vec::new(),
@@ -1530,20 +1586,31 @@ pub async fn set_repeat_until_cloudkit(
             }
             // The list holds the bare id; the record is named with a prefix. Apple's own
             // records are written that way, and a mismatch leaves a rule nothing points at.
-            let id = uuid::Uuid::new_v4().to_string().to_uppercase();
-            client
-                .create_record(
-                    ZONE,
-                    &format!("RecurrenceRule/{id}"),
-                    "RecurrenceRule",
-                    rule_fields(
-                        &repeat,
-                        end_at,
-                        days,
-                        client.reference_to(ZONE, &reminder.guid),
-                    ),
-                )
-                .await?;
+            let id = rule_id.map_or_else(
+                || uuid::Uuid::new_v4().to_string().to_uppercase(),
+                ToString::to_string,
+            );
+            let name = format!("RecurrenceRule/{id}");
+            // Made by an earlier send whose answer was lost: that one is used.
+            let made = match rule_id {
+                Some(_) => client.lookup_record(ZONE, &name).await?.is_some(),
+                None => false,
+            };
+            if !made {
+                client
+                    .create_record(
+                        ZONE,
+                        &name,
+                        "RecurrenceRule",
+                        rule_fields(
+                            &repeat,
+                            end_at,
+                            days,
+                            client.reference_to(ZONE, &reminder.guid),
+                        ),
+                    )
+                    .await?;
+            }
             vec![id]
         }
     };
@@ -1625,6 +1692,10 @@ pub struct ReminderEdit {
     pub list_guid: Option<String>,
     /// Nest under another reminder, or `Some(None)` to bring it back out to the top level.
     pub parent_guid: Option<Option<String>>,
+    /// The IANA zone a timed date is kept in when the reminder has none yet; `None` is this
+    /// computer's zone. Not an edit on its own: it only goes with a due date.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 impl ReminderEdit {
@@ -1763,10 +1834,15 @@ async fn edit_once(
         // A reminder already kept in a zone keeps it, as the phone does when its time is
         // changed: the field is left out, so Apple's copy stays exactly as it was.
         if due.is_some() && !all_day && reminder.timezone.is_none() {
-            let zone = jiff::tz::TimeZone::system();
+            let zone = edit.timezone.clone().unwrap_or_else(|| {
+                jiff::tz::TimeZone::system()
+                    .iana_name()
+                    .unwrap_or("UTC")
+                    .to_string()
+            });
             fields.insert(
                 "TimeZone".into(),
-                serde_json::json!({ "type": "STRING", "value": zone.iana_name().unwrap_or("UTC") }),
+                serde_json::json!({ "type": "STRING", "value": zone }),
             );
         }
         fields.insert(
@@ -5105,6 +5181,101 @@ pub async fn set_alarm_cloudkit(
         }
         client.delete_record(ZONE, &format!("Alarm/{id}")).await?;
     }
+    Ok(())
+}
+
+/// Add one alert at a reminder's due time, as Apple holds the due date when the alarm is
+/// written (a date moved on a phone since the reminder was queued is the one it rings at), under
+/// alarm and trigger ids chosen before it is sent (bare ids), and leave every other alarm it
+/// has as it is. A reminder Apple holds with no due date gets no alarm: nothing to ring at. For a reminder made here
+/// with its alert: a send repeated after a lost answer or a restart finds the records it made
+/// and finishes the job, so it never adds a second alert or leaves one nothing points at.
+///
+/// The same three records as [`set_alarm_cloudkit`], in the same order: the alarm, its
+/// trigger, then the reminder's list of alarms, which is read and written over the exact
+/// version read, so an alarm a phone added meanwhile stays in the list.
+///
+/// # Errors
+/// When Apple refuses any of the writes, or no longer has the reminder.
+pub async fn add_alarm_named_cloudkit(
+    http: &reqwest::Client,
+    ckdatabasews_root: &str,
+    params: Vec<(String, String)>,
+    reminder_guid: &str,
+    timezone: &str,
+    alarm_id: &str,
+    trigger_id: &str,
+) -> Result<()> {
+    let client = ZoneClient::new(http, ckdatabasews_root, CONTAINER, params);
+    let listed = |record: &Value| {
+        record
+            .pointer("/fields/AlarmIDs/value")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .any(|x| x.eq_ignore_ascii_case(alarm_id))
+            })
+    };
+    let current = client
+        .lookup_record(ZONE, reminder_guid)
+        .await?
+        .ok_or_else(|| Error::Protocol("Apple no longer has that reminder.".into()))?;
+    if listed(&current) {
+        return Ok(());
+    }
+    let Some(at_seconds) = field::timestamp_seconds(&current, "DueDate") else {
+        return Ok(());
+    };
+    let components = date_components(at_seconds, timezone)?;
+    let alarm = format!("Alarm/{alarm_id}");
+    if client.lookup_record(ZONE, &alarm).await?.is_none() {
+        client
+            .create_record(
+                ZONE,
+                &alarm,
+                "Alarm",
+                serde_json::json!({
+                    "AlarmUID": { "type": "STRING", "value": alarm_id },
+                    "TriggerID": { "type": "STRING", "value": trigger_id },
+                    "Reminder": client.reference_to(ZONE, reminder_guid),
+                    "Deleted": { "type": "NUMBER_INT64", "value": 0 },
+                    "Imported": { "type": "NUMBER_INT64", "value": 0 },
+                }),
+            )
+            .await?;
+    }
+    let trigger = format!("AlarmTrigger/{trigger_id}");
+    if client.lookup_record(ZONE, &trigger).await?.is_none() {
+        client
+            .create_record(
+                ZONE,
+                &trigger,
+                "AlarmTrigger",
+                serde_json::json!({
+                    "Alarm": client.reference_to(ZONE, &alarm),
+                    "DateComponentsData": { "type": "BYTES", "value": components },
+                    "Type": { "type": "STRING", "value": "Date" },
+                    "Deleted": { "type": "NUMBER_INT64", "value": 0 },
+                    "Imported": { "type": "NUMBER_INT64", "value": 0 },
+                }),
+            )
+            .await?;
+    }
+    client
+        .edit_record_signed(ZONE, reminder_guid, "Reminder", |r| {
+            if listed(r) {
+                return None;
+            }
+            let mut ids: Vec<Value> = r
+                .pointer("/fields/AlarmIDs/value")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            ids.push(Value::String(alarm_id.to_string()));
+            Some(serde_json::json!({ "AlarmIDs": { "type": "STRING_LIST", "value": ids } }))
+        })
+        .await?;
     Ok(())
 }
 

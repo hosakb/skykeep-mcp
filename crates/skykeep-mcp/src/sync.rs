@@ -146,6 +146,22 @@ pub(crate) fn reread_key(service: &str) -> String {
     format!("mcp.full_reread.{service}")
 }
 
+/// Whether this write's sender answers done only when CloudKit took every write it makes: a
+/// reminder create with no date or flag (one write, made once), or one with a repeat or
+/// alerts, whose every step fails the change. A dated plain create logs and skips a failed
+/// date or flag, and other senders can skip work, so they are not called accepted.
+fn every_write_checked(p: &quince_core::outbox::Pending) -> bool {
+    if p.service != "reminders" || p.kind != "create" {
+        return false;
+    }
+    serde_json::from_str::<quince_sync::reminders::Create>(&p.payload).is_ok_and(|c| {
+        c.repeat.is_some()
+            || c.alarm.is_some()
+            || c.early_alert.is_some()
+            || (c.due_at.is_none() && c.flagged.is_none())
+    })
+}
+
 /// Skykeep's own refusal codes are shown; engine and Apple reasons can hold HTTP text.
 fn shown_reason(reason: &str) -> &str {
     if reason.starts_with("mcp_quarantine:")
@@ -329,9 +345,21 @@ async fn sync_pass(
     );
     let root = ctx.cloudkit.as_deref().ok_or("service_unavailable")?;
     let mut services = Vec::new();
+    // Each write waiting before the drain: the ones gone after it, not refused, left the
+    // queue. Only some senders answer done only when CloudKit took every write; the rest can
+    // finish with a part logged and skipped, or with nothing written (a tick another device
+    // overtook), so leaving the queue is reported as accepted only for those. Neither is read
+    // back.
+    let mut waiting_before = Vec::new();
     for service in ["notes", "reminders"] {
         let lock = Mutex::new(());
         let before = pass::run(service, &ctx, &data, &lock).await;
+        waiting_before.extend(
+            data.lock()
+                .await
+                .outbox_pending(service)
+                .map_err(|_| "library_unavailable")?,
+        );
         // Never send when the authenticated read is gated or failed.
         let mut sent = false;
         if matches!(before.outcome, pass::Outcome::Ok) {
@@ -396,6 +424,29 @@ async fn sync_pass(
         .outbox_count()
         .map_err(|_| "library_unavailable")?
         .saturating_sub(refused.len());
+    let mut still = Vec::new();
+    for service in ["notes", "reminders"] {
+        still.extend(
+            library
+                .outbox_pending(service)
+                .map_err(|_| "library_unavailable")?
+                .into_iter()
+                .map(|p| p.id),
+        );
+    }
+    let left: Vec<Value> = waiting_before
+        .iter()
+        .filter(|p| !still.contains(&p.id) && !refused.iter().any(|r| r.id == p.id))
+        .take(MAX_PENDING)
+        .map(|p| {
+            let outcome = if every_write_checked(p) {
+                "cloudkit_accepted"
+            } else {
+                "finished_unconfirmed"
+            };
+            json!({"service":p.service,"kind":p.kind,"record":p.record,"outcome":outcome})
+        })
+        .collect();
     // Bounded: admission stops at MAX_PENDING waiting writes, and each is refused at most once.
     let refused_now: Vec<Value> = refused
         .iter()
@@ -404,6 +455,6 @@ async fn sync_pass(
         .map(refused_view)
         .collect();
     Ok(
-        json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"}),
+        json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"left_queue_this_sync":left,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"}),
     )
 }

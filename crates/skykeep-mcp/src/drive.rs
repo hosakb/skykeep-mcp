@@ -738,7 +738,7 @@ impl Stop {
     fn error(self) -> quince_icloud::Error {
         match self {
             Stop::Reauth => quince_icloud::Error::ReauthRequired,
-            Stop::Busy => quince_icloud::Error::Busy,
+            Stop::Busy => quince_icloud::Error::Busy(None),
             Stop::Paused => quince_icloud::Error::NeedsDeviceApproval,
             other => quince_icloud::Error::Protocol(other.code().into()),
         }

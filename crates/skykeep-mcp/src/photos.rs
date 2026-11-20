@@ -13,6 +13,7 @@ use crate::contacts::{encoded_len, gate, owner, read_capped, record_timeout_of};
 use quince_auth::{Client, Endpoints, Store};
 use quince_core::photos::{Album, Kind, Photo, Source, View};
 use quince_core::Library;
+use quince_icloud::cloudkit;
 use quince_icloud::photos::{self as apple, PhotosFetch, Readiness};
 use quince_sync::{library_lock::LibraryLock, pass};
 use serde::Deserialize;
@@ -713,7 +714,7 @@ impl Stop {
     fn error(self) -> quince_icloud::Error {
         match self {
             Stop::Reauth => quince_icloud::Error::ReauthRequired,
-            Stop::Busy => quince_icloud::Error::Busy,
+            Stop::Busy => quince_icloud::Error::Busy(None),
             Stop::Locked => quince_icloud::Error::NeedsDeviceApproval,
             other => quince_icloud::Error::Protocol(other.code().into()),
         }
@@ -741,24 +742,49 @@ fn query(client: &Client) -> Vec<(String, String)> {
 /// refusal's body is read only to recognise Advanced Data Protection's words.
 async fn post(
     client: &Client,
-    url: &str,
+    root: &str,
+    operation: &str,
     body: &Value,
     cap: usize,
     budget: &mut usize,
 ) -> Result<Value, Stop> {
+    // Apple asked for the container to be left alone (`cloudkit::container_busy`): nothing
+    // is sent until then, by this refresh or the engine's own clients.
+    if cloudkit::container_held_off(root, apple::CONTAINER).is_some() {
+        return Err(Stop::Busy);
+    }
     let response = client
         .http()
-        .post(url)
+        .post(url(root, operation))
         .query(&query(client))
         .json(body)
         .send()
         .await
         .map_err(|_| Stop::Failed)?;
     let status = response.status().as_u16();
-    let bytes = read_capped!(response, cap, budget)?;
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let busy = matches!(status, 429 | 503);
+    let bytes = match read_capped!(response, cap, budget) {
+        Ok(bytes) => bytes,
+        // A busy answer whose body is too large or cut off still holds for its header's wait.
+        Err(stop) => {
+            if busy {
+                cloudkit::container_busy(root, apple::CONTAINER, "", retry_after.as_deref());
+            }
+            return Err(stop);
+        }
+    };
     if !(200..300).contains(&status) {
-        if quince_icloud::locked_by_data_protection(&String::from_utf8_lossy(&bytes)) {
+        let text = String::from_utf8_lossy(&bytes);
+        if quince_icloud::locked_by_data_protection(&text) {
             return Err(Stop::Locked);
+        }
+        if busy {
+            cloudkit::container_busy(root, apple::CONTAINER, &text, retry_after.as_deref());
         }
         return Err(match status {
             401 | 421 | 450 => Stop::Reauth,
@@ -774,7 +800,7 @@ async fn post(
 }
 
 /// A zone-level refusal inside a 200 answer, as the engine reads one (`cloudkit::trouble_with`).
-fn zone_trouble(result: &Value) -> Option<Stop> {
+fn zone_trouble(root: &str, result: &Value) -> Option<Stop> {
     let code = result.get("serverErrorCode").and_then(Value::as_str);
     let reason = result.get("reason").and_then(Value::as_str);
     match code {
@@ -789,7 +815,10 @@ fn zone_trouble(result: &Value) -> Option<Stop> {
         {
             Some(Stop::StaleToken)
         }
-        Some("THROTTLED" | "TRY_AGAIN_LATER" | "ZONE_BUSY") => Some(Stop::Busy),
+        Some("THROTTLED" | "TRY_AGAIN_LATER" | "ZONE_BUSY") => {
+            cloudkit::container_busy(root, apple::CONTAINER, &result.to_string(), None);
+            Some(Stop::Busy)
+        }
         Some("AUTHENTICATION_FAILED" | "AUTHENTICATION_REQUIRED") => Some(Stop::Reauth),
         _ => Some(Stop::Failed),
     }
@@ -805,7 +834,8 @@ async fn library_zone(
 ) -> Result<String, Stop> {
     let list = post(
         client,
-        &url(root, "zones/list"),
+        root,
+        "zones/list",
         &json!({}),
         limits.max_small_bytes,
         budget,
@@ -821,7 +851,9 @@ async fn library_zone(
             continue;
         };
         if zone.get("serverErrorCode").is_some() {
-            if name.starts_with(apple::DEFAULT_ZONE) && zone_trouble(zone) == Some(Stop::Locked) {
+            if name.starts_with(apple::DEFAULT_ZONE)
+                && zone_trouble(root, zone) == Some(Stop::Locked)
+            {
                 return Err(Stop::Locked);
             }
             continue;
@@ -848,13 +880,14 @@ async fn ready(
 ) -> Result<(), Stop> {
     let answer = post(
         client,
-        &url(root, "records/query"),
+        root,
+        "records/query",
         &json!({"query":{"recordType":"CheckIndexingState"},"zoneID":zone_id(zone)}),
         limits.max_small_bytes,
         budget,
     )
     .await?;
-    if let Some(stop) = zone_trouble(&answer) {
+    if let Some(stop) = zone_trouble(root, &answer) {
         return Err(stop);
     }
     let records = answer
@@ -926,7 +959,8 @@ async fn feed_page(
     }
     let mut answer = post(
         client,
-        &url(root, "changes/zone"),
+        root,
+        "changes/zone",
         &json!({"zones":[zone_body]}),
         limits.max_response_bytes,
         budget,
@@ -937,7 +971,7 @@ async fn feed_page(
         .and_then(Value::as_array_mut)
         .and_then(|zones| zones.first_mut())
         .ok_or(Stop::Failed)?;
-    if let Some(stop) = zone_trouble(result) {
+    if let Some(stop) = zone_trouble(root, result) {
         return Err(stop);
     }
     let records = match result.get_mut("records").map(Value::take) {

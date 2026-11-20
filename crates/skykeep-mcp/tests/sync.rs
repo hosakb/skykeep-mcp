@@ -87,7 +87,7 @@ async fn configured_native_send_uses_exact_grant_and_tampering_never_reaches_net
         &quince_sync::queue::account_tag("1234567890"),
         |p| {
             assert!(skykeep_mcp::sync::authorized(&library, dir.path(), &p).is_ok());
-            async { Err(quince_icloud::Error::Busy) }
+            async { Err(quince_icloud::Error::Busy(None)) }
         },
     )
     .await;
